@@ -8,6 +8,11 @@ const ICE_CONFIG = {
     iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun3.l.google.com:19302' },
+        { urls: 'stun:stun4.l.google.com:19302' },
+        // [TIP] Add your TURN server here for 100% reliability
+        // { urls: 'turn:your-turn-server.com', username: 'user', credential: 'password' }
     ],
 };
 
@@ -125,6 +130,20 @@ export default function useWebRTC() {
             if (item) item.displayName = newName;
             setPeers((prev) => prev.map((p) => p.peerID === id ? { ...p, displayName: newName } : p));
             if (id === socket.id) setMyName(newName);
+        });
+
+        socket.on('renegotiate', (payload) => {
+            const item = peersRef.current.find((p) => p.peerID === payload.callerID);
+            if (item) {
+                item.peer.signal(payload.signal);
+            }
+        });
+
+        socket.on('renegotiate-answer', (payload) => {
+            const item = peersRef.current.find((p) => p.peerID === payload.callerID);
+            if (item) {
+                item.peer.signal(payload.signal);
+            }
         });
 
         socket.on('chat-message', (msg) => {
@@ -321,7 +340,48 @@ export default function useWebRTC() {
     };
 }
 
-// ── Peer creation ──
+// ── Peer creation helpers ──
+
+function attachICERestart(peer, label) {
+    let restartAttempts = 0;
+    const MAX_RESTARTS = 3;
+
+    if (!peer._pc) return;
+
+    peer._pc.oniceconnectionstatechange = () => {
+        const state = peer._pc?.iceConnectionState;
+        console.log(`[ICE ${label}] ${state}`);
+
+        if (state === 'connected' || state === 'completed') {
+            restartAttempts = 0; // reset on success
+            console.log(`[ICE ${label}] ✅ Connected!`);
+        }
+
+        if ((state === 'failed' || state === 'disconnected') && restartAttempts < MAX_RESTARTS) {
+            restartAttempts++;
+            console.warn(`[ICE ${label}] ⚠️ ${state} — restarting ICE (attempt ${restartAttempts}/${MAX_RESTARTS})`);
+            try {
+                // simple-peer exposes negotiate() which triggers a new offer
+                peer._pc.restartIce();
+                peer.negotiate();
+            } catch (e) {
+                console.error(`[ICE ${label}] restart failed:`, e);
+            }
+        }
+    };
+
+    peer.on('connect', () => {
+        console.log(`[Peer ${label}] ✅ Data channel open`);
+    });
+
+    peer.on('error', (err) => {
+        console.error(`[Peer ${label}] ❌ Error:`, err.message || err);
+    });
+
+    peer.on('close', () => {
+        console.log(`[Peer ${label}] 🔌 Closed`);
+    });
+}
 
 function createPeer(userToSignal, callerID, stream, socket) {
     const peer = new Peer({
@@ -331,8 +391,14 @@ function createPeer(userToSignal, callerID, stream, socket) {
         config: ICE_CONFIG,
     });
     peer.on('signal', (signal) => {
-        socket.emit('sending-signal', { userToSignal, callerID, signal });
+        if (signal.renegotiate) {
+            socket.emit('renegotiate', { targetID: userToSignal, signal });
+        } else {
+            socket.emit('sending-signal', { userToSignal, callerID, signal });
+        }
     });
+
+    attachICERestart(peer, `-> ${userToSignal.slice(-4)}`);
     return peer;
 }
 
@@ -344,8 +410,14 @@ function addPeer(incomingSignal, callerID, stream, socket) {
         config: ICE_CONFIG,
     });
     peer.on('signal', (signal) => {
-        socket.emit('returning-signal', { signal, callerID });
+        if (signal.renegotiate) {
+            socket.emit('renegotiate-answer', { targetID: callerID, signal });
+        } else {
+            socket.emit('returning-signal', { signal, callerID });
+        }
     });
+
+    attachICERestart(peer, `<- ${callerID.slice(-4)}`);
     peer.signal(incomingSignal);
     return peer;
 }

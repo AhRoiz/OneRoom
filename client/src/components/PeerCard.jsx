@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { User, Video } from 'lucide-react';
+import { User, Video, Wifi, WifiOff } from 'lucide-react';
 
 export default function PeerCard({ peer, displayName, index, isDeafened, audioOutputId }) {
     const audioRef = useRef(null);
@@ -9,36 +9,71 @@ export default function PeerCard({ peer, displayName, index, isDeafened, audioOu
     const [barHeights, setBarHeights] = useState(new Array(16).fill(2));
     const [isSpeaking, setIsSpeaking] = useState(false);
     const [hasVideo, setHasVideo] = useState(false);
+    const [connectionState, setConnectionState] = useState('connecting'); // connecting | connected | failed
 
     useEffect(() => {
         if (!peer) return;
 
         let audioCtx = null;
 
+        // Track ICE connection state for this peer
+        const pc = peer._pc;
+        if (pc) {
+            const updateState = () => {
+                const state = pc.iceConnectionState;
+                if (state === 'connected' || state === 'completed') setConnectionState('connected');
+                else if (state === 'failed' || state === 'closed') setConnectionState('failed');
+                else setConnectionState('connecting');
+            };
+            pc.addEventListener('iceconnectionstatechange', updateState);
+            updateState(); // set initial state
+        }
+
         const handleStream = (stream) => {
-            // Audio
-            if (audioRef.current) {
-                audioRef.current.srcObject = stream;
-                audioRef.current.muted = isDeafened;
-                if (audioOutputId && audioRef.current.setSinkId) {
-                    audioRef.current.setSinkId(audioOutputId).catch(() => { });
+            console.log(`[PeerCard] Received stream from ${displayName}, tracks:`,
+                stream.getTracks().map(t => `${t.kind}:${t.readyState}`));
+
+            // Audio — force the audio element to use this stream
+            const audio = audioRef.current;
+            if (audio) {
+                audio.srcObject = stream;
+                audio.muted = isDeafened;
+
+                if (audioOutputId && audio.setSinkId) {
+                    audio.setSinkId(audioOutputId).catch(() => { });
+                }
+
+                // Explicitly try to play (handles autoplay policy)
+                const playPromise = audio.play();
+                if (playPromise) {
+                    playPromise.catch((err) => {
+                        console.warn(`[PeerCard] Audio play failed for ${displayName}:`, err.message);
+                        // Retry on user interaction
+                        const retryPlay = () => {
+                            audio.play().catch(() => { });
+                            document.removeEventListener('click', retryPlay);
+                        };
+                        document.addEventListener('click', retryPlay, { once: true });
+                    });
                 }
             }
 
-            // Check for video
+            // Check for video tracks
             const videoTracks = stream.getVideoTracks();
             if (videoTracks.length > 0 && videoTracks[0].readyState === 'live') {
                 setHasVideo(true);
                 if (videoRef.current) videoRef.current.srcObject = stream;
             }
 
-            // Audio analyser
+            // Audio analyser for visualizer
             try {
+                if (audioCtx) audioCtx.close().catch(() => { });
                 audioCtx = new (window.AudioContext || window.webkitAudioContext)();
                 const source = audioCtx.createMediaStreamSource(stream);
                 const analyser = audioCtx.createAnalyser();
                 analyser.fftSize = 64;
                 source.connect(analyser);
+                // NOTE: Do NOT connect analyser to audioCtx.destination — that would cause echo
                 analyserRef.current = analyser;
                 const dataArray = new Uint8Array(analyser.frequencyBinCount);
 
@@ -63,7 +98,6 @@ export default function PeerCard({ peer, displayName, index, isDeafened, audioOu
         peer.on('stream', handleStream);
 
         // Handle tracks added via renegotiation (camera/screen share)
-        const pc = peer._pc;
         if (pc) {
             const origOnTrack = pc.ontrack;
             pc.ontrack = (event) => {
@@ -96,12 +130,31 @@ export default function PeerCard({ peer, displayName, index, isDeafened, audioOu
         }
     }, [audioOutputId]);
 
+    const stateColor = connectionState === 'connected' ? 'var(--accent)'
+        : connectionState === 'failed' ? 'var(--danger)'
+            : '#ffaa00';
+    const stateLabel = connectionState === 'connected' ? 'linked'
+        : connectionState === 'failed' ? 'lost'
+            : 'syncing';
+
     return (
         <div className={`glass peer-card ${isSpeaking ? 'speaking' : ''}`}
             style={{
                 padding: '0.875rem', display: 'flex', flexDirection: 'column',
                 alignItems: 'center', gap: '0.625rem', position: 'relative', zIndex: 1,
             }}>
+            {/* Connection state badge */}
+            <div style={{
+                position: 'absolute', top: 6, right: 6,
+                display: 'flex', alignItems: 'center', gap: 3,
+                fontSize: '0.5rem', color: stateColor,
+                letterSpacing: '0.05em', fontWeight: 600,
+                opacity: 0.7,
+            }}>
+                {connectionState === 'connected' ? <Wifi size={8} /> : <WifiOff size={8} />}
+                {stateLabel}
+            </div>
+
             {/* Video or Avatar */}
             {hasVideo ? (
                 <div style={{
